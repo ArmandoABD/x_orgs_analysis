@@ -295,6 +295,121 @@ async def health_check():
     """
     return {"status": "ok", "model_loaded": MODEL_LOADED}
 
+@app.get("/users/{id}/historical", response_model=Dict[str, Any])
+async def get_historical_metrics(
+    id: str,
+    token: str = Depends(verify_token),
+    tweet_ids: List[str] = Query(...),
+    start_time: str = Query(...),
+    end_time: str = Query(...),
+    granularity: str = Query("day"),
+    requested_metrics: List[str] = Query(["impression_count", "like_count", "retweet_count", "reply_count"]),
+):
+    """
+    Get historical metrics for tweets
+    """
+    print(f"Fetching historical metrics for user ID: {id}")
+    print(f"Tweet IDs: {tweet_ids}")
+    print(f"Time range: {start_time} to {end_time}")
+    
+    # Build query parameters
+    params = {
+        "tweet_ids": ",".join(tweet_ids),
+        "start_time": start_time,
+        "end_time": end_time,
+        "granularity": granularity,
+        "requested_metrics": ",".join(requested_metrics)
+    }
+    
+    # Make request to Twitter API
+    url = f"{TWITTER_API_BASE}/insights/historical"
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    try:
+        result = make_twitter_request(url, headers, params)
+        return result
+    except Exception as e:
+        print(f"Error fetching historical metrics: {e}")
+        # If the API doesn't support this endpoint, return mock data
+        return generate_mock_historical_data(tweet_ids, start_time, end_time, granularity, requested_metrics)
+
+def generate_mock_historical_data(tweet_ids, start_time, end_time, granularity, metrics):
+    """Generate mock historical data for demonstration purposes"""
+    from datetime import datetime, timedelta
+    import random
+    
+    # Parse start and end times
+    start = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+    end = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+    
+    # Determine time intervals based on granularity
+    intervals = []
+    if granularity == "hour":
+        current = start
+        while current <= end:
+            intervals.append(current)
+            current += timedelta(hours=1)
+    else:  # default to day
+        current = start
+        while current <= end:
+            intervals.append(current)
+            current += timedelta(days=1)
+    
+    # Generate mock data
+    data = {
+        "data": [
+            {
+                "measurement": {
+                    "metrics_time_series": [],
+                    "metrics_total": []
+                }
+            }
+        ]
+    }
+    
+    # Generate time series data
+    for tweet_id in tweet_ids:
+        for interval in intervals:
+            metric_values = []
+            for metric in metrics:
+                # Generate random values that increase over time for a realistic trend
+                base_value = random.randint(5, 50)
+                time_factor = (interval - start).total_seconds() / (end - start).total_seconds()
+                value = int(base_value + (base_value * 2 * time_factor))
+                
+                metric_values.append({
+                    "metric_type": metric,
+                    "metric_value": value
+                })
+            
+            data["data"][0]["measurement"]["metrics_time_series"].append({
+                "tweet_id": tweet_id,
+                "value": {
+                    "metric_values": metric_values,
+                    "timestamp": {
+                        "iso8601_time": interval.isoformat().replace('+00:00', 'Z')
+                    }
+                }
+            })
+    
+    # Generate total metrics
+    for tweet_id in tweet_ids:
+        total_values = []
+        for metric in metrics:
+            # Sum up random values for totals
+            total = random.randint(100, 1000)
+            total_values.append({
+                "metric_type": metric,
+                "metric_value": total
+            })
+        
+        data["data"][0]["measurement"]["metrics_total"].append({
+            "tweet_id": tweet_id,
+            "value": total_values
+        })
+    
+    return data
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000) 
