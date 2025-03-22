@@ -10,6 +10,10 @@ from dotenv import load_dotenv
 import threading
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
+import fireworks.client
+import datetime
+import random
+from openai import OpenAI
 
 # Load environment variables from .env file
 load_dotenv()
@@ -31,7 +35,7 @@ def load_model():
 # Start model loading in a separate thread
 threading.Thread(target=load_model).start()
 
-app = FastAPI(title="Twitter API Proxy")
+app = FastAPI(title="X API Proxy")
 
 # CORS middleware to allow frontend requests
 app.add_middleware(
@@ -52,6 +56,13 @@ API_KEY = os.getenv("TWITTER_API_KEY", "")
 API_SECRET = os.getenv("TWITTER_API_SECRET", "")
 ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN", "")
 ACCESS_TOKEN_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET", "")
+
+# Set up Fireworks AI client
+FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "")
+if FIREWORKS_API_KEY:
+    fireworks.client.api_key = FIREWORKS_API_KEY
+else:
+    print("WARNING: FIREWORKS_API_KEY environment variable is not set!")
 
 # Print a warning if the bearer token is missing
 if not DEFAULT_BEARER_TOKEN:
@@ -155,7 +166,7 @@ async def get_user_posts(
     place_fields: Optional[List[str]] = Query(None),
 ):
     """
-    Get tweets from a user using the real Twitter API
+    Get tweets for a user using the Twitter API
     """
     print(f"Fetching tweets for user ID: {id}")
     print(f"Parameters: max_results={max_results}, exclude={exclude}")
@@ -178,6 +189,7 @@ async def get_user_posts(
         params["end_time"] = end_time
     if tweet_fields:
         params["tweet.fields"] = ",".join(tweet_fields)
+        print(f"Requesting tweet fields: {params['tweet.fields']}")
     if expansions:
         params["expansions"] = ",".join(expansions)
     if media_fields:
@@ -193,9 +205,23 @@ async def get_user_posts(
     url = f"{TWITTER_API_BASE}/users/{id}/tweets"
     headers = {"Authorization": f"Bearer {token}"}
     
+    print(f"Making request to: {url}")
+    print(f"With params: {params}")
+    
     result = make_twitter_request(url, headers, params)
-    tweet_count = len(result.get('data', [])) if 'data' in result else 0
-    print(f"Retrieved {tweet_count} tweets")
+    
+    # Debug the full response structure
+    print(f"Response structure: {list(result.keys())}")
+    
+    # Check if public_metrics are included in the response
+    if 'data' in result and len(result['data']) > 0:
+        first_tweet = result['data'][0]
+        print(f"First tweet keys: {list(first_tweet.keys())}")
+        has_metrics = 'public_metrics' in first_tweet
+        print(f"Retrieved {len(result['data'])} tweets. Public metrics included: {has_metrics}")
+        if not has_metrics:
+            print("WARNING: public_metrics not included in tweet data. Make sure tweet.fields includes 'public_metrics'")
+    
     return result
 
 # Function to analyze sentiment of a tweet using NLTK VADER
@@ -295,121 +321,277 @@ async def health_check():
     """
     return {"status": "ok", "model_loaded": MODEL_LOADED}
 
-@app.get("/users/{id}/historical", response_model=Dict[str, Any])
-async def get_historical_metrics(
-    id: str,
-    token: str = Depends(verify_token),
-    tweet_ids: List[str] = Query(...),
-    start_time: str = Query(...),
-    end_time: str = Query(...),
-    granularity: str = Query("day"),
-    requested_metrics: List[str] = Query(["impression_count", "like_count", "retweet_count", "reply_count"]),
-):
-    """
-    Get historical metrics for tweets
-    """
-    print(f"Fetching historical metrics for user ID: {id}")
-    print(f"Tweet IDs: {tweet_ids}")
-    print(f"Time range: {start_time} to {end_time}")
-    
-    # Build query parameters
-    params = {
-        "tweet_ids": ",".join(tweet_ids),
-        "start_time": start_time,
-        "end_time": end_time,
-        "granularity": granularity,
-        "requested_metrics": ",".join(requested_metrics)
-    }
-    
-    # Make request to Twitter API
-    url = f"{TWITTER_API_BASE}/insights/historical"
-    headers = {"Authorization": f"Bearer {token}"}
+# Load environment variables
+load_dotenv()
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "")
+
+# Update the Perplexity API call function to use OpenAI client and refer to "posts"
+def get_perplexity_context(posts):
+    """Get concise additional context about posts using Perplexity API"""
+    if not PERPLEXITY_API_KEY:
+        print("WARNING: PERPLEXITY_API_KEY not set")
+        return None
     
     try:
-        result = make_twitter_request(url, headers, params)
-        return result
-    except Exception as e:
-        print(f"Error fetching historical metrics: {e}")
-        # If the API doesn't support this endpoint, return mock data
-        return generate_mock_historical_data(tweet_ids, start_time, end_time, granularity, requested_metrics)
-
-def generate_mock_historical_data(tweet_ids, start_time, end_time, granularity, metrics):
-    """Generate mock historical data for demonstration purposes"""
-    from datetime import datetime, timedelta
-    import random
-    
-    # Parse start and end times
-    start = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-    end = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
-    
-    # Determine time intervals based on granularity
-    intervals = []
-    if granularity == "hour":
-        current = start
-        while current <= end:
-            intervals.append(current)
-            current += timedelta(hours=1)
-    else:  # default to day
-        current = start
-        while current <= end:
-            intervals.append(current)
-            current += timedelta(days=1)
-    
-    # Generate mock data
-    data = {
-        "data": [
-            {
-                "measurement": {
-                    "metrics_time_series": [],
-                    "metrics_total": []
-                }
-            }
-        ]
-    }
-    
-    # Generate time series data
-    for tweet_id in tweet_ids:
-        for interval in intervals:
-            metric_values = []
-            for metric in metrics:
-                # Generate random values that increase over time for a realistic trend
-                base_value = random.randint(5, 50)
-                time_factor = (interval - start).total_seconds() / (end - start).total_seconds()
-                value = int(base_value + (base_value * 2 * time_factor))
-                
-                metric_values.append({
-                    "metric_type": metric,
-                    "metric_value": value
-                })
-            
-            data["data"][0]["measurement"]["metrics_time_series"].append({
-                "tweet_id": tweet_id,
-                "value": {
-                    "metric_values": metric_values,
-                    "timestamp": {
-                        "iso8601_time": interval.isoformat().replace('+00:00', 'Z')
-                    }
-                }
-            })
-    
-    # Generate total metrics
-    for tweet_id in tweet_ids:
-        total_values = []
-        for metric in metrics:
-            # Sum up random values for totals
-            total = random.randint(100, 1000)
-            total_values.append({
-                "metric_type": metric,
-                "metric_value": total
-            })
+        # Format posts for the prompt without numbering
+        posts_text = "\n\n".join(posts)
         
-        data["data"][0]["measurement"]["metrics_total"].append({
-            "tweet_id": tweet_id,
-            "value": total_values
-        })
+        # Create the prompt requesting concise context
+        prompt = f"Provide very concise insights about these posts (2-3 sentences max):\n\n{posts_text}"
+        
+        # Initialize the OpenAI client
+        client = OpenAI(api_key=PERPLEXITY_API_KEY, base_url="https://api.perplexity.ai")
+        
+        # Call the Perplexity API with the OpenAI client
+        response = client.chat.completions.create(
+            model="sonar-pro",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that provides extremely concise context (2-3 sentences max) about social media posts."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        # Extract the context from the response
+        if response and response.choices:
+            context = response.choices[0].message.content
+            return context
+        
+        return None
     
-    return data
+    except Exception as e:
+        print(f"Error calling Perplexity API: {e}")
+        return None
+
+# Update the analyze_tweets_with_ai function to use "posts" terminology
+@app.post("/analyze/tweets/ai", response_model=Dict[str, Any])
+async def analyze_posts_with_ai(request: Dict[str, Any]):
+    """
+    Analyze social media posts using Fireworks AI LLaMA model with Perplexity context
+    """
+    if not FIREWORKS_API_KEY:
+        return {
+            "error": "Fireworks API key not configured",
+            "analysis": "AI analysis is not available. Please configure a Fireworks API key."
+        }
+    
+    posts = request.get("tweets", [])  # Keep parameter name for compatibility
+    concise = request.get("concise", False)
+    
+    if not posts or len(posts) == 0:
+        return {
+            "error": "No posts provided",
+            "analysis": "No posts were provided for analysis."
+        }
+    
+    try:
+        # Get additional context from Perplexity API
+        context = get_perplexity_context(posts)
+        
+        # Format the posts for the prompt without numbering
+        posts_text = "\n\n".join(posts)
+        
+        # Create a more direct prompt focused on a concise overview without referencing specific posts
+        if context:
+            prompt = f"""Review these social media posts:
+
+                    {posts_text}
+                    
+                    Additional context about these posts:
+                    {context}
+
+                    Provide a concise 3-4 sentence overview of these posts. Focus on:
+                    - The main themes or messaging
+                    - What makes them effective or ineffective
+                    - One specific suggestion for improvement
+                    
+                    Keep your response to 3-4 sentences total. Do not reference specific posts by number.
+                    """
+        else:
+            prompt = f"""Review these social media posts:
+
+                    {posts_text}
+
+                    Provide a concise 3-4 sentence overview of these posts. Focus on:
+                    - The main themes or messaging
+                    - What makes them effective or ineffective
+                    - One specific suggestion for improvement
+                    
+                    Keep your response to 3-4 sentences total. Do not reference specific posts by number.
+                    """
+        
+        # Call the Fireworks AI API
+        response = fireworks.client.ChatCompletion.create(
+            model="accounts/fireworks/models/llama-v3p1-405b-instruct",
+            messages=[
+                {"role": "system", "content": "You are an expert social media analyst who provides extremely concise, insightful overviews without referencing specific posts by number."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1024,
+            temperature=0.7,
+        )
+        
+        # Extract the analysis from the response
+        analysis = response.choices[0].message.content
+        
+        return {
+            "analysis": analysis,
+            "context": context
+        }
+        
+    except Exception as e:
+        print(f"Error in AI analysis: {e}")
+        return {
+            "error": str(e),
+            "analysis": "An error occurred while analyzing the posts with AI."
+        }
+
+# Update the chat endpoint to use "posts" terminology
+@app.post("/analyze/tweets/chat", response_model=Dict[str, Any])
+async def chat_about_posts(
+    request: Dict[str, Any],
+    token: str = Depends(verify_token)
+):
+    """
+    Chat with AI about social media posts
+    """
+    if not FIREWORKS_API_KEY:
+        return {
+            "error": "Fireworks API key not configured",
+            "response": "AI chat is not available. Please configure a Fireworks API key."
+        }
+    
+    posts = request.get("tweets", [])  # Keep parameter name for compatibility
+    chat_history = request.get("chat_history", "")
+    user_message = request.get("user_message", "")
+    
+    if not posts or not user_message:
+        return {
+            "error": "No posts or message provided",
+            "response": "I need both posts and a message to respond to."
+        }
+    
+    try:
+        # Format the posts for the prompt
+        posts_text = "\n\n".join([f"Post {i+1}: {post}" for i, post in enumerate(posts)])
+        
+        # Create the prompt for the LLaMA model
+        prompt = f"""You are an AI assistant specializing in social media analysis. You have access to the following recent posts from an organization:
+
+            {posts_text}
+
+            Chat history:
+            {chat_history}
+
+            User's question: {user_message}
+
+            Please provide a helpful, informative response about these posts based on the user's question.
+            """
+        
+        # Call the Fireworks AI API
+        response = fireworks.client.ChatCompletion.create(
+            model="accounts/fireworks/models/llama-v3p1-405b-instruct",
+            messages=[
+                {"role": "system", "content": "You are an AI assistant specializing in social media analysis."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1024,
+            temperature=0.7,
+        )
+        
+        # Extract the response from the API
+        ai_response = response.choices[0].message.content
+        
+        return {
+            "response": ai_response
+        }
+        
+    except Exception as e:
+        print(f"Error calling Fireworks AI for chat: {e}")
+        return {
+            "error": str(e),
+            "response": "An error occurred while processing your question."
+        }
+
+@app.get("/tweets/{id}/liking_users", response_model=Dict[str, Any])
+async def get_tweet_liking_users(
+    id: str,
+    token: str = Depends(verify_token),
+    max_results: Optional[int] = 10,
+    pagination_token: Optional[str] = None,
+    user_fields: Optional[List[str]] = Query(None),
+    expansions: Optional[List[str]] = Query(None),
+    tweet_fields: Optional[List[str]] = Query(None),
+):
+    """
+    Get users who liked a tweet using the Twitter API
+    """
+    print(f"Fetching users who liked tweet ID: {id}")
+    
+    # Build query parameters
+    params = {}
+    if max_results:
+        params["max_results"] = max_results
+    if pagination_token:
+        params["pagination_token"] = pagination_token
+    if user_fields:
+        params["user.fields"] = ",".join(user_fields)
+    if expansions:
+        params["expansions"] = ",".join(expansions)
+    if tweet_fields:
+        params["tweet.fields"] = ",".join(tweet_fields)
+    
+    # Make request to Twitter API
+    url = f"{TWITTER_API_BASE}/tweets/{id}/liking_users"
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    print(f"Making request to: {url}")
+    print(f"With params: {params}")
+    
+    result = make_twitter_request(url, headers, params)
+    
+    # Debug the response structure
+    print(f"Liking users response structure: {list(result.keys())}")
+    
+    # Check if we have data
+    if 'data' in result:
+        like_count = len(result['data'])
+        print(f"Retrieved {like_count} users who liked the tweet")
+    else:
+        print(f"No users found who liked the tweet. Response: {result}")
+    
+    return result
+
+# Add this function to check token permissions
+@app.get("/check-token", response_model=Dict[str, Any])
+async def check_token_permissions(token: str = Depends(verify_token)):
+    """
+    Check the permissions of the provided token
+    """
+    try:
+        # Make a request to the Twitter API to check token permissions
+        url = f"{TWITTER_API_BASE}/users/me"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            return {
+                "status": "ok",
+                "message": "Token is valid",
+                "data": response.json()
+            }
+        else:
+            return {
+                "status": "error",
+                "message": f"Token check failed with status code: {response.status_code}",
+                "error": response.text
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Error checking token: {str(e)}"
+        }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(app, host="0.0.0.0", port=8000)

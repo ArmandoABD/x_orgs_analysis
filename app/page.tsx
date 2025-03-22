@@ -3,6 +3,10 @@
 import { useState, useEffect, useRef } from "react";
 import Image from "next/image";
 import { Chart, registerables } from 'chart.js';
+import { remark } from 'remark';
+import remarkGfm from 'remark-gfm';
+import remarkHtml from 'remark-html';
+
 Chart.register(...registerables);
 
 interface Tweet {
@@ -96,6 +100,12 @@ interface HistoricalMetrics {
   }>;
 }
 
+interface AIAnalysis {
+  analysis: string;
+  context?: string;
+  error?: string;
+}
+
 export default function Home() {
   // State variables
   const [username, setUsername] = useState<string>("Tesla");
@@ -109,8 +119,11 @@ export default function Home() {
   const [token, setToken] = useState<string>("");
   const [sentimentAnalysis, setSentimentAnalysis] = useState<SentimentAnalysis | null>(null);
   const [historicalMetrics, setHistoricalMetrics] = useState<HistoricalMetrics | null>(null);
-  const chartRef = useRef<HTMLCanvasElement>(null);
-  const chartInstance = useRef<Chart | null>(null);
+  const [aiAnalysis, setAiAnalysis] = useState<AIAnalysis | null>(null);
+  const [loadingAiAnalysis, setLoadingAiAnalysis] = useState<boolean>(false);
+  const [chatMessages, setChatMessages] = useState<Array<{role: string, content: string}>>([]);
+  const [chatInput, setChatInput] = useState<string>("");
+  const [chatLoading, setChatLoading] = useState<boolean>(false);
 
   // Fetch user info and tweets on initial load
   useEffect(() => {
@@ -133,6 +146,11 @@ export default function Home() {
   const lookupUser = async () => {
     setLoading(true);
     setError(null);
+    
+    // Reset analysis states when changing accounts
+    setAiAnalysis(null);
+    setSentimentAnalysis(null);
+    setHistoricalMetrics(null);
     
     try {
       // Lookup user
@@ -171,6 +189,25 @@ export default function Home() {
     }
   };
 
+  // Function to add mock metrics if they're missing
+  const addMockMetricsIfNeeded = (tweets: Tweet[]): Tweet[] => {
+    return tweets.map(tweet => {
+      if (!tweet.public_metrics) {
+        console.log(`Adding mock metrics to tweet ${tweet.id}`);
+        return {
+          ...tweet,
+          public_metrics: {
+            like_count: Math.floor(Math.random() * 1000) + 100,
+            retweet_count: Math.floor(Math.random() * 200) + 20,
+            reply_count: Math.floor(Math.random() * 100) + 10,
+            quote_count: Math.floor(Math.random() * 50) + 5
+          }
+        };
+      }
+      return tweet;
+    });
+  };
+
   // Function to fetch tweets for a user
   const fetchTweets = async (userId: string, paginationToken?: string) => {
     if (!paginationToken) {
@@ -192,6 +229,8 @@ export default function Home() {
         params.append("pagination_token", paginationToken);
       }
       
+      console.log("Fetching tweets with params:", params.toString());
+      
       // Fetch tweets
       const response = await fetch(`http://localhost:8000/users/${userId}/tweets?${params.toString()}`, {
         headers: {
@@ -204,42 +243,32 @@ export default function Home() {
       }
       
       const data: ApiResponse = await response.json();
+      console.log("Full API response:", data);
       
       if (data.errors) {
-        // Check if it's a rate limit error
-        const isRateLimit = data.errors.some(err => 
-          err.title === "Too Many Requests" || err.status === 429
-        );
-        
-        if (isRateLimit) {
-          throw new Error("Twitter API rate limit exceeded. Please try again in a few minutes.");
-        } else {
-          throw new Error(data.errors[0]?.detail || "Error fetching tweets");
-        }
+        throw new Error(data.errors[0]?.detail || "Error fetching tweets");
       }
       
       if (data.data && data.data.length > 0) {
+        const newTweets = data.data;
+        
+        // Debug the first tweet structure
+        console.log("First tweet structure:", newTweets[0]);
+        console.log("First tweet keys:", Object.keys(newTweets[0]));
+        
         if (paginationToken) {
-          const newTweets = [...tweets, ...data.data];
-          setTweets(newTweets);
-          
-          // Fetch historical metrics for the first 5 tweets
-          const tweetIds = newTweets.slice(0, 5).map(t => t.id);
-          console.log("Fetching historical metrics for tweet IDs:", tweetIds);
-          await fetchHistoricalMetrics(userId, tweetIds);
+          setTweets([...tweets, ...newTweets]);
         } else {
-          setTweets(data.data);
-          
-          // Fetch historical metrics for the first 5 tweets
-          const tweetIds = data.data.slice(0, 5).map(t => t.id);
-          console.log("Fetching historical metrics for tweet IDs:", tweetIds);
-          await fetchHistoricalMetrics(userId, tweetIds);
+          setTweets(newTweets);
+        }
+        
+        // Set next pagination token if available
+        setNextToken(data.meta?.next_token || null);
+      } else {
+        if (!paginationToken) {
+          setTweets([]);
         }
       }
-      
-      // Save next token for pagination
-      setNextToken(data.meta?.next_token || null);
-      
     } catch (err) {
       setError(err instanceof Error ? err.message : "An unknown error occurred");
     } finally {
@@ -269,29 +298,169 @@ export default function Home() {
     }
   };
 
-  // Format date for display
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString);
-    return date.toLocaleDateString('en-US', { 
-      month: 'short', 
-      day: 'numeric',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    });
+  // Update the formatDate function to handle undefined dates
+  const formatDate = (dateString: string | undefined) => {
+    // Check if dateString is undefined or null
+    if (!dateString) {
+      console.warn("Date string is undefined or null");
+      return "Unknown date";
+    }
+    
+    try {
+      // Twitter API returns dates in ISO 8601 format
+      const date = new Date(dateString);
+      
+      // Check if date is valid
+      if (isNaN(date.getTime())) {
+        console.error("Invalid date string:", dateString);
+        return "Unknown date";
+      }
+      
+      // Format the date
+      return new Intl.DateTimeFormat('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      }).format(date);
+    } catch (error) {
+      console.error("Error formatting date:", error, dateString);
+      return "Unknown date";
+    }
   };
 
-  // Calculate engagement metrics
-  const engagement = tweets.length > 0 ? {
-    totalLikes: tweets.reduce((sum, tweet) => sum + (tweet.public_metrics?.like_count || 0), 0),
-    totalRetweets: tweets.reduce((sum, tweet) => sum + (tweet.public_metrics?.retweet_count || 0), 0),
-    totalReplies: tweets.reduce((sum, tweet) => sum + (tweet.public_metrics?.reply_count || 0), 0),
-    totalQuotes: tweets.reduce((sum, tweet) => sum + (tweet.public_metrics?.quote_count || 0), 0),
-    avgLikes: tweets.reduce((sum, tweet) => sum + (tweet.public_metrics?.like_count || 0), 0) / tweets.length,
-    avgRetweets: tweets.reduce((sum, tweet) => sum + (tweet.public_metrics?.retweet_count || 0), 0) / tweets.length,
-    avgReplies: tweets.reduce((sum, tweet) => sum + (tweet.public_metrics?.reply_count || 0), 0) / tweets.length,
-    avgQuotes: tweets.reduce((sum, tweet) => sum + (tweet.public_metrics?.quote_count || 0), 0) / tweets.length,
-  } : null;
+  // Add this function to analyze tweets with AI
+  const analyzeWithAI = async (tweets: Tweet[]) => {
+    if (!tweets.length) return;
+    
+    setLoadingAiAnalysis(true);
+    
+    try {
+      // Check backend health first
+      const isHealthy = await checkBackendHealth();
+      if (!isHealthy) {
+        throw new Error("Backend server is not responding");
+      }
+      
+      const response = await fetch('http://localhost:8000/analyze/tweets/ai', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer dummy-token'
+        },
+        body: JSON.stringify({
+          tweets: tweets.map(tweet => tweet.text)
+        })
+      });
+      
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      setAiAnalysis(data);
+    } catch (err) {
+      console.error('Error analyzing with AI:', err);
+      setAiAnalysis({
+        error: err instanceof Error ? err.message : "Failed to analyze with AI",
+        analysis: "An error occurred during AI analysis."
+      });
+    } finally {
+      setLoadingAiAnalysis(false);
+    }
+  };
+
+  // Add this function to render markdown
+  const renderMarkdown = (markdown: string) => {
+    if (!markdown) return '';
+    
+    try {
+      const result = remark()
+        .use(remarkGfm)
+        .use(remarkHtml)
+        .processSync(markdown);
+      
+      return result.toString();
+    } catch (error) {
+      console.error('Error rendering markdown:', error);
+      return markdown;
+    }
+  };
+
+  // Add this function to send chat messages
+  const sendChatMessage = async (message: string) => {
+    if (!message.trim() || chatLoading) return;
+    
+    // Add user message to chat
+    const userMessage = { role: 'user', content: message };
+    setChatMessages([...chatMessages, userMessage]);
+    setChatInput('');
+    setChatLoading(true);
+    
+    try {
+      // Check backend health first
+      const isHealthy = await checkBackendHealth();
+      if (!isHealthy) {
+        throw new Error("Backend server is not responding");
+      }
+      
+      // Create chat history string
+      const chatHistoryText = chatMessages
+        .map(msg => `${msg.role === 'user' ? 'User' : 'AI'}: ${msg.content}`)
+        .join('\n');
+      
+      const response = await fetch('http://localhost:8000/analyze/tweets/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer dummy-token'
+        },
+        body: JSON.stringify({
+          tweets: tweets.slice(0, 5).map(tweet => tweet.text),
+          chat_history: chatHistoryText,
+          user_message: message
+        })
+      });
+      
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      
+      // Add AI response to chat
+      setChatMessages([...chatMessages, userMessage, { role: 'assistant', content: data.response }]);
+    } catch (err) {
+      console.error('Error sending chat message:', err);
+      setChatMessages([
+        ...chatMessages, 
+        userMessage, 
+        { 
+          role: 'assistant', 
+          content: `Error: ${err instanceof Error ? err.message : "Failed to get response"}`
+        }
+      ]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  // Add this function to check backend health
+  const checkBackendHealth = async () => {
+    try {
+      const response = await fetch('http://localhost:8000/health');
+      if (response.ok) {
+        const data = await response.json();
+        console.log("Backend health:", data);
+        return data.status === "ok";
+      }
+      return false;
+    } catch (err) {
+      console.error("Backend health check failed:", err);
+      return false;
+    }
+  };
 
   // Add this function to analyze sentiment
   const analyzeSentiment = async (tweets: Tweet[]) => {
@@ -327,212 +496,17 @@ export default function Home() {
     }
   };
 
-  // Add this function to check backend health
-  const checkBackendHealth = async () => {
-    try {
-      const response = await fetch('http://localhost:8000/health');
-      if (response.ok) {
-        const data = await response.json();
-        console.log("Backend health:", data);
-        return data.status === "ok";
-      }
-      return false;
-    } catch (err) {
-      console.error("Backend health check failed:", err);
-      return false;
-    }
-  };
-
-  // Add this function to fetch historical metrics
-  const fetchHistoricalMetrics = async (userId: string, tweetIds: string[]) => {
-    if (!tweetIds.length) return;
-    
-    try {
-      // Calculate date range (last 7 days)
-      const endDate = new Date();
-      const startDate = new Date();
-      startDate.setDate(startDate.getDate() - 7);
-      
-      // Format dates as ISO strings
-      const startTime = startDate.toISOString().split('.')[0] + 'Z';
-      const endTime = endDate.toISOString().split('.')[0] + 'Z';
-      
-      // Build query parameters
-      const params = new URLSearchParams();
-      tweetIds.forEach(id => params.append('tweet_ids', id));
-      params.append('start_time', startTime);
-      params.append('end_time', endTime);
-      params.append('granularity', 'day');
-      ['impression_count', 'like_count', 'retweet_count', 'reply_count'].forEach(
-        metric => params.append('requested_metrics', metric)
-      );
-      
-      console.log("Fetching historical metrics with params:", params.toString());
-      
-      // Fetch historical metrics
-      const response = await fetch(`http://localhost:8000/users/${userId}/historical?${params.toString()}`, {
-        headers: {
-          "Authorization": "Bearer dummy-token"
-        }
-      });
-      
-      if (!response.ok) {
-        throw new Error(`API error: ${response.status}`);
-      }
-      
-      const data = await response.json();
-      console.log("Historical metrics data:", data);
-      setHistoricalMetrics(data);
-      
-    } catch (err) {
-      console.error('Error fetching historical metrics:', err);
-    }
-  };
-
-  // Add this useEffect to create the chart when historical metrics data is received
-  useEffect(() => {
-    if (historicalMetrics && chartRef.current) {
-      createEngagementChart(historicalMetrics);
-    }
-  }, [historicalMetrics]);
-
-  // Update the createEngagementChart function with better error handling
-  const createEngagementChart = (data: any) => {
-    if (!chartRef.current) return;
-    
-    // Destroy existing chart if it exists
-    if (chartInstance.current) {
-      chartInstance.current.destroy();
-    }
-    
-    // Validate data structure
-    if (!data || !data.data || !Array.isArray(data.data) || data.data.length === 0) {
-      console.error("Invalid historical metrics data structure:", data);
-      return;
-    }
-    
-    // Extract data for the chart - with safer access
-    const measurement = data.data[0]?.measurement;
-    if (!measurement || !measurement.metrics_time_series) {
-      console.error("Missing metrics_time_series in data:", data);
-      return;
-    }
-    
-    const timeSeriesData = measurement.metrics_time_series || [];
-    
-    // Group by timestamp
-    const groupedByTime: Record<string, Record<string, number>> = {};
-    
-    timeSeriesData.forEach((series: any) => {
-      if (!series.value || !series.value.timestamp || !series.value.metric_values) {
-        return; // Skip invalid entries
-      }
-      
-      const timestamp = series.value.timestamp.iso8601_time;
-      if (!timestamp) return;
-      
-      const date = new Date(timestamp).toLocaleDateString();
-      
-      if (!groupedByTime[date]) {
-        groupedByTime[date] = {};
-      }
-      
-      series.value.metric_values.forEach((metric: any) => {
-        if (!metric.metric_type) return;
-        
-        const metricType = metric.metric_type;
-        if (!groupedByTime[date][metricType]) {
-          groupedByTime[date][metricType] = 0;
-        }
-        groupedByTime[date][metricType] += metric.metric_value || 0;
+  // Add this debugging function to check tweet metrics
+  const debugTweetMetrics = (tweets: Tweet[]) => {
+    console.log("Debugging tweet metrics:");
+    tweets.forEach((tweet, index) => {
+      console.log(`Tweet ${index + 1}:`, {
+        id: tweet.id,
+        text: tweet.text.substring(0, 30) + "...",
+        hasPublicMetrics: !!tweet.public_metrics,
+        metrics: tweet.public_metrics
       });
     });
-    
-    // Check if we have any data to display
-    const labels = Object.keys(groupedByTime).sort((a, b) => 
-      new Date(a).getTime() - new Date(b).getTime()
-    );
-    
-    if (labels.length === 0) {
-      console.error("No valid data points found for chart");
-      return;
-    }
-    
-    // Prepare data for Chart.js
-    const datasets = [
-      {
-        label: 'Likes',
-        data: labels.map(date => groupedByTime[date]['like_count'] || 0),
-        borderColor: 'rgb(59, 130, 246)',
-        backgroundColor: 'rgba(59, 130, 246, 0.5)',
-        tension: 0.1
-      },
-      {
-        label: 'Retweets',
-        data: labels.map(date => groupedByTime[date]['retweet_count'] || 0),
-        borderColor: 'rgb(16, 185, 129)',
-        backgroundColor: 'rgba(16, 185, 129, 0.5)',
-        tension: 0.1
-      },
-      {
-        label: 'Replies',
-        data: labels.map(date => groupedByTime[date]['reply_count'] || 0),
-        borderColor: 'rgb(139, 92, 246)',
-        backgroundColor: 'rgba(139, 92, 246, 0.5)',
-        tension: 0.1
-      }
-    ];
-    
-    // Create the chart
-    const ctx = chartRef.current.getContext('2d');
-    if (ctx) {
-      try {
-        chartInstance.current = new Chart(ctx, {
-          type: 'line',
-          data: {
-            labels,
-            datasets
-          },
-          options: {
-            responsive: true,
-            plugins: {
-              legend: {
-                position: 'top',
-                labels: {
-                  color: 'rgb(209, 213, 219)'
-                }
-              },
-              title: {
-                display: true,
-                text: 'Engagement Over Time (Last 7 Days)',
-                color: 'rgb(209, 213, 219)'
-              }
-            },
-            scales: {
-              x: {
-                ticks: {
-                  color: 'rgb(156, 163, 175)'
-                },
-                grid: {
-                  color: 'rgba(75, 85, 99, 0.2)'
-                }
-              },
-              y: {
-                ticks: {
-                  color: 'rgb(156, 163, 175)'
-                },
-                grid: {
-                  color: 'rgba(75, 85, 99, 0.2)'
-                },
-                beginAtZero: true
-              }
-            }
-          }
-        });
-      } catch (err) {
-        console.error("Error creating chart:", err);
-      }
-    }
   };
 
   return (
@@ -625,87 +599,201 @@ export default function Home() {
           </div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          <div className="lg:col-span-2">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {/* Left column - 2/3 width */}
+          <div className="md:col-span-2 space-y-6">
+            {/* Latest Tweets card */}
             <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
               <div className="p-4 border-b border-gray-800 flex justify-between items-center">
-                <h2 className="text-xl font-semibold">
-                  {showAllTweets ? "Latest 100 Tweets" : "Latest 5 Tweets"}
-                </h2>
-                <button
-                  onClick={toggleTweetView}
-                  className="text-blue-400 hover:text-blue-300 transition-colors"
-                >
-                  {showAllTweets ? "Show Less" : "Show More"}
-                </button>
+                <h2 className="text-xl font-semibold">Latest 5 Posts</h2>
+                {tweets.length > 0 && (
+                  <button
+                    onClick={() => setShowAllTweets(!showAllTweets)}
+                    className="text-blue-400 hover:text-blue-300 text-sm"
+                  >
+                    {showAllTweets ? "Show Less" : "Show More"}
+                  </button>
+                )}
               </div>
               
-              {loading ? (
-                <div className="p-8 text-center">
-                  <div className="inline-block animate-spin rounded-full h-8 w-8 border-4 border-gray-700 border-t-blue-500"></div>
-                  <p className="mt-2 text-gray-400">Loading tweets...</p>
-                </div>
-              ) : tweets.length > 0 ? (
-                <div>
-                  <ul className="divide-y divide-gray-800">
-                    {tweets.map(tweet => (
-                      <li key={tweet.id} className="p-4 hover:bg-gray-800/50 transition-colors">
-                        <div className="flex items-start gap-3">
-                          <div className="flex-1">
-                            <div className="flex items-baseline gap-2">
-                              <span className="font-semibold">@{user?.username}</span>
-                              <span className="text-sm text-gray-400">{formatDate(tweet.created_at)}</span>
+              {/* Tweets list */}
+              {tweets.length > 0 ? (
+                <div className="divide-y divide-gray-800">
+                  {(showAllTweets ? tweets : tweets.slice(0, 5)).map((tweet) => (
+                    <div key={tweet.id} className="py-4">
+                      <div className="flex items-start">
+                        <div className="flex-shrink-0 mr-3">
+                          {user?.profile_image_url ? (
+                            <Image
+                              src={user.profile_image_url}
+                              alt={user.name}
+                              width={40}
+                              height={40}
+                              className="rounded-full"
+                            />
+                          ) : (
+                            <div className="bg-gray-800 rounded-full h-10 w-10 flex items-center justify-center text-xl font-bold">
+                              {user?.name?.charAt(0) || "?"}
                             </div>
-                            <p className="mt-1 text-gray-200">{tweet.text}</p>
-                            {tweet.public_metrics && (
-                              <div className="mt-2 flex gap-4 text-sm text-gray-400">
-                                <span className="flex items-center">
-                                  <svg className="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" />
-                                  </svg>
-                                  {tweet.public_metrics.like_count}
-                                </span>
-                                <span className="flex items-center">
-                                  <svg className="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
-                                  </svg>
-                                  {tweet.public_metrics.retweet_count}
-                                </span>
-                                <span className="flex items-center">
-                                  <svg className="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
-                                  </svg>
-                                  {tweet.public_metrics.reply_count}
-                                </span>
-                              </div>
-                            )}
-                          </div>
+                          )}
                         </div>
-                      </li>
-                    ))}
-                  </ul>
-                  
-                  {nextToken && (
-                    <div className="p-4 border-t border-gray-800">
-                      <button
-                        onClick={loadMoreTweets}
-                        disabled={loadingMore}
-                        className="w-full py-2 bg-gray-800 hover:bg-gray-700 rounded text-center transition-colors"
-                      >
-                        {loadingMore ? "Loading more..." : "Load More Tweets"}
-                      </button>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center text-sm mb-1">
+                            <span className="font-medium">{user?.name}</span>
+                            <span className="text-gray-500 mx-1">·</span>
+                            <span className="text-gray-500">@{user?.username}</span>
+                          </div>
+                          <div className="text-sm mb-2 whitespace-pre-wrap">{tweet.text}</div>
+                        </div>
+                      </div>
                     </div>
-                  )}
+                  ))}
                 </div>
               ) : (
-                <div className="p-8 text-center text-gray-400">
-                  No tweets found.
+                <div className="text-center py-8">
+                  {loading ? (
+                    <div>
+                      <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-gray-700 border-t-blue-500 mb-4"></div>
+                      <p className="text-gray-400">Loading posts...</p>
+                    </div>
+                  ) : error ? (
+                    <div className="text-red-400">{error}</div>
+                  ) : (
+                    <p className="text-gray-400">No posts found</p>
+                  )}
                 </div>
               )}
             </div>
+            
+            {/* AI Analysis - Directly under Latest Tweets */}
+            <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+              <div className="p-4 border-b border-gray-800">
+                <h2 className="text-xl font-semibold">AI Posts Analysis</h2>
+              </div>
+              <div className="p-6">
+                {loadingAiAnalysis ? (
+                  <div className="text-center">
+                    <div className="inline-block animate-spin rounded-full h-8 w-8 border-4 border-gray-700 border-t-blue-500"></div>
+                    <p className="mt-2 text-gray-400">Analyzing posts with AI...</p>
+                  </div>
+                ) : aiAnalysis ? (
+                  <div>
+                    {aiAnalysis.error ? (
+                      <div className="text-red-400">{aiAnalysis.error}</div>
+                    ) : (
+                      <div>
+                        <div className="prose prose-invert max-w-none">
+                          <div dangerouslySetInnerHTML={{ __html: renderMarkdown(aiAnalysis.analysis) }}></div>
+                        </div>
+                        
+                        {aiAnalysis.context && (
+                          <div className="mt-4 pt-4 border-t border-gray-800">
+                            <h3 className="text-lg font-medium mb-2 text-gray-300">Additional Context</h3>
+                            <div className="prose prose-invert max-w-none text-sm text-gray-400">
+                              <div dangerouslySetInnerHTML={{ __html: renderMarkdown(aiAnalysis.context) }}></div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ) : tweets.length > 0 ? (
+                  <div className="text-center text-gray-400">
+                    <p>Click to analyze tweets with AI</p>
+                    <button
+                      onClick={() => analyzeWithAI(tweets.slice(0, 5))}
+                      className="mt-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded transition-colors"
+                    >
+                      Analyze with AI
+                    </button>
+                  </div>
+                ) : (
+                  <div className="text-center text-gray-400">
+                    No posts available to analyze
+                  </div>
+                )}
+              </div>
+            </div>
+            
+            {/* Chat with AI Posts Assistant */}
+            <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+              <div className="p-4 border-b border-gray-800">
+                <h2 className="text-xl font-semibold">Chat with AI Posts Assistant</h2>
+              </div>
+              <div className="p-6">
+                {tweets.length > 0 ? (
+                  <div className="space-y-4">
+                    {/* Chat messages */}
+                    <div className="bg-gray-800 rounded-lg p-4 h-80 overflow-y-auto">
+                      {chatMessages.length > 0 ? (
+                        <div className="space-y-4">
+                          {chatMessages.map((msg, index) => (
+                            <div key={index} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                              <div className={`max-w-3/4 rounded-lg p-3 ${
+                                msg.role === 'user' 
+                                  ? 'bg-blue-600 text-white' 
+                                  : 'bg-gray-700 text-gray-200'
+                              }`}>
+                                {msg.content}
+                              </div>
+                            </div>
+                          ))}
+                          {chatLoading && (
+                            <div className="flex justify-start">
+                              <div className="bg-gray-700 text-gray-200 rounded-lg p-3">
+                                <div className="flex space-x-2">
+                                  <div className="w-2 h-2 rounded-full bg-gray-400 animate-bounce"></div>
+                                  <div className="w-2 h-2 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+                                  <div className="w-2 h-2 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '0.4s' }}></div>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="h-full flex items-center justify-center text-gray-400">
+                          <div className="text-center">
+                            <p>Ask questions about the posts above</p>
+                            <p className="text-sm mt-2">For example: "How can I make these posts more engaging with current trends?"</p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    
+                    {/* Chat input */}
+                    <div className="flex">
+                      <input
+                        type="text"
+                        value={chatInput}
+                        onChange={(e) => setChatInput(e.target.value)}
+                        onKeyPress={(e) => e.key === 'Enter' && sendChatMessage(chatInput)}
+                        placeholder="Ask about these tweets..."
+                        className="flex-grow bg-gray-800 border border-gray-700 rounded-l-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        disabled={chatLoading}
+                      />
+                      <button
+                        onClick={() => sendChatMessage(chatInput)}
+                        disabled={!chatInput.trim() || chatLoading}
+                        className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-r-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-8.707l-3-3a1 1 0 00-1.414 1.414L10.586 9H7a1 1 0 100 2h3.586l-1.293 1.293a1 1 0 101.414 1.414l3-3a1 1 0 000-1.414z" clipRule="evenodd" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center text-gray-400 py-8">
+                    No posts available to chat about
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
           
-          <div className="space-y-8">
+          {/* Right column - 1/3 width */}
+          <div className="space-y-6">
+            {/* Sentiment Analysis card */}
             <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
               <div className="p-4 border-b border-gray-800">
                 <h2 className="text-xl font-semibold">Sentiment Analysis</h2>
@@ -759,7 +847,7 @@ export default function Home() {
                       </div>
                     </div>
                     <p className="text-sm text-gray-400">
-                      Based on analysis of the 5 most recent tweets
+                      Based on analysis of the 5 most recent posts
                     </p>
                   </div>
                 ) : tweets.length > 0 ? (
@@ -778,78 +866,6 @@ export default function Home() {
                   </div>
                 )}
               </div>
-            </div>
-            
-            <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-              <div className="p-4 border-b border-gray-800">
-                <h2 className="text-xl font-semibold">Engagement Metrics</h2>
-              </div>
-              <div className="p-6">
-                {engagement ? (
-                  <div className="space-y-4">
-                    <div>
-                      <h3 className="text-lg font-medium mb-2 text-gray-300">Average per Tweet</h3>
-                      <div className="grid grid-cols-2 gap-4">
-                        <div className="bg-blue-900/20 border border-blue-800/50 p-3 rounded-lg">
-                          <div className="text-2xl font-bold text-blue-400">{engagement.avgLikes.toFixed(1)}</div>
-                          <div className="text-sm text-gray-400">Likes</div>
-                        </div>
-                        <div className="bg-green-900/20 border border-green-800/50 p-3 rounded-lg">
-                          <div className="text-2xl font-bold text-green-400">{engagement.avgRetweets.toFixed(1)}</div>
-                          <div className="text-sm text-gray-400">Retweets</div>
-                        </div>
-                        <div className="bg-purple-900/20 border border-purple-800/50 p-3 rounded-lg">
-                          <div className="text-2xl font-bold text-purple-400">{engagement.avgReplies.toFixed(1)}</div>
-                          <div className="text-sm text-gray-400">Replies</div>
-                        </div>
-                        <div className="bg-orange-900/20 border border-orange-800/50 p-3 rounded-lg">
-                          <div className="text-2xl font-bold text-orange-400">{engagement.avgQuotes.toFixed(1)}</div>
-                          <div className="text-sm text-gray-400">Quotes</div>
-                        </div>
-                      </div>
-                    </div>
-                    
-                    <div>
-                      <h3 className="text-lg font-medium mb-2 text-gray-300">Total Engagement</h3>
-                      <div className="grid grid-cols-2 gap-4">
-                        <div className="p-3 border border-gray-700 rounded-lg">
-                          <div className="text-2xl font-bold text-gray-200">{engagement.totalLikes.toLocaleString()}</div>
-                          <div className="text-sm text-gray-400">Total Likes</div>
-                        </div>
-                        <div className="p-3 border border-gray-700 rounded-lg">
-                          <div className="text-2xl font-bold text-gray-200">{engagement.totalRetweets.toLocaleString()}</div>
-                          <div className="text-sm text-gray-400">Total Retweets</div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="text-center text-gray-400">
-                    No engagement data available
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className="mt-6 pt-6 border-t border-gray-800">
-              <h3 className="text-lg font-medium mb-4 text-gray-300">Historical Engagement (Last 7 Days)</h3>
-              
-              {historicalMetrics ? (
-                <div className="h-64">
-                  <canvas ref={chartRef}></canvas>
-                </div>
-              ) : (
-                <div className="text-center text-gray-400 py-8">
-                  {loading ? (
-                    <div>
-                      <div className="inline-block animate-spin rounded-full h-8 w-8 border-4 border-gray-700 border-t-blue-500"></div>
-                      <p className="mt-2">Loading historical data...</p>
-                    </div>
-                  ) : (
-                    <p>No historical data available</p>
-                  )}
-                </div>
-              )}
             </div>
           </div>
         </div>

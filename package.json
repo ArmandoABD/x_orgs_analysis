@@ -10,9 +10,14 @@
   },
   "dependencies": {
     "chart.js": "^4.4.8",
+    "marked": "^15.0.7",
     "next": "^15.2.3",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "remark": "^15.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-html": "^16.0.1",
+    "remark-react": "^9.0.1"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
